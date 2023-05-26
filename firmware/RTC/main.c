@@ -13,7 +13,10 @@
 	V0.1  - August 25, 2021 - basic implementation
     V0.2  - August 28, 2021 - Added auto brightness control
     V2.0  - May    16, 2023 - Changed engine to use DS3231 RTC    
-
+    V2.1  - May    25, 2023 - Bug fixes: Handling of 12/24 hour bit
+                              Button logic was reversed to workarount ghost pulses on RA3/MCLR
+                              line that were issued during power up and caused the hour to advance
+                              every time the clock waked from power down
 */
 
 
@@ -43,16 +46,11 @@ uint16_t __at _CONFIG configWord = _INTRC_OSC_NOCLKOUT & _MCLRE_OFF & _CPD_OFF &
 //   / _` / -_)  _| | ' \| |  _| / _ \ ' \(_-<
 //   \__,_\___|_| |_|_||_|_|\__|_\___/_||_/__/
 //                                            
-#define _tresholdTime 3  // 16ms * 3 ~48ms
 
-#define BUTTON1 !RA3 // ((PORTA & (1<<3)))  // RA3
-#define BUTTON2 !RA1 // ((PORTA & (1<<1)))  // RA1
-
-
-#define OUT 0
-#define INP 1
-
-
+// Button Stuff 
+#define BUTTON1 RA3  // !RA3
+#define BUTTON2 RA1  // !RA1
+#define _tresholdTime 4  // 16ms * 4 ~65ms
 
 // I2C Stuff
 #define SDA  RA4
@@ -60,17 +58,23 @@ uint16_t __at _CONFIG configWord = _INTRC_OSC_NOCLKOUT & _MCLRE_OFF & _CPD_OFF &
 #define sendACK     true
 #define sendNACK    false
 #define RTC_ADDRESS 0x68
-
+#define OUT 0
+#define INP 1
 #define DIR_SDA TRISA4
 #define DIR_SCL TRISA5
 
-// I2C macros
+
+//
+//    _ __  __ _ __ _ _ ___ ___
+//   | '  \/ _` / _| '_/ _ (_-<
+//   |_|_|_\__,_\__|_| \___/__/
+//
 #define sclHigh()   do { DIR_SCL = INP;  SCL = 1; } while (0)
 #define sclLow()    do { DIR_SCL = OUT;  SCL = 0; } while (0)
 #define sdaHigh()   do { DIR_SDA = INP;  SDA = 1; } while (0)
 #define sdaLow()    do { DIR_SDA = OUT;  SDA = 0; } while (0)
 #define sdaGet()    SDA 
-#define I2Cdelay()  do {for (uint8_t i=1;i>0;i--) __asm__ ("nop\n\t"); } while (0)
+#define I2Cdelay()  do {for (uint8_t i=1;i<3;i--) __asm__ ("nop\n\t"); } while (0)
 
 
 //               _               _
@@ -146,10 +150,9 @@ typedef union  {
 //                                      
 
 t_ds3231records rtc;
-static volatile uint8_t hours   = 23;
-static volatile uint8_t minutes = 59;
+static volatile uint8_t hours   = 0;
+static volatile uint8_t minutes = 0;
 static uint8_t seconds = 0;
-static uint32_t bres=0;
 
 static volatile uint8_t go=0;
 static volatile uint8_t tickCounter=0;
@@ -259,14 +262,25 @@ void main (void) {
     uint8_t adcValue,lighSenseCounter=0;
     
 	init_hw(); // Initialize hardware
-		
-	// main loop, run once at every ~4ms
+
+	if ( !readRtc() ) { // test RTC reading  at the beginning, initialize some values if failed
+           rtc.rawdata[0] = 0x00; // 00 Seconds
+           rtc.rawdata[1] = 0x23; // 23 Minutes
+           rtc.rawdata[2] = 0x23; // 23 Hours (in 24 hr format)
+           rtc.rawdata[3] = 0x04; // 04 Day of week
+           rtc.rawdata[4] = 0x23; // 23 Day of Month
+           rtc.rawdata[5] = 0x04; // 04 Month (+ century=0)
+           rtc.rawdata[6] = 0x23; // 23 Year
+		}
+
+
+	// main loop, run once at every ~16ms
 	for (;;){
-		while (!go); // wait for 4ms flag
+		while (!go); // wait for 16ms flag
 		go=0;        // reset go flag
 
 
-		// Test for buttons
+		// Process Button 1 - hour set
 		if (BUTTON1) { // button pressed
 			if (timeButton1pressed<255) timeButton1pressed++;	
 		} else {       // Release
@@ -276,6 +290,7 @@ void main (void) {
 			timeButton1pressed =0;
 		}
 
+		// Process Button 2 - minute set
 		if (BUTTON2) { // button pressed
 			if (timeButton2pressed<255) timeButton2pressed++;	
 		} else {       // Release
@@ -285,7 +300,7 @@ void main (void) {
 			timeButton2pressed =0;
 		}	
         
-        // Read the LDR
+        // Adjust brightness according with light read from LDR 
         #define VOFFSET 87
         #define VRANGE  31
         if (++lighSenseCounter == 63 )  {  // overflow @ every ~1 second (63 * 16ms)
@@ -308,19 +323,32 @@ void main (void) {
         }
 
 
-		
+		// read the RTC 
 		if ( readRtc() ) {
-			minutes = rtc.datetime.minutes.tens * 10 + rtc.datetime.minutes.units;
-			hours   = rtc.datetime.hours.tens   * 10 + rtc.datetime.hours.units;
-			}  else { // make display error pattern
-				animateError();  
-				}
 
-        
+			// Compute minutes
+			minutes = rtc.datetime.minutes.tens * 10 + rtc.datetime.minutes.units;
+					
+			// Compute hours, taking 12/24 hour into account
+			hours   = ( rtc.datetime.hours.tens & 1) * 10 + rtc.datetime.hours.units; // base time
+			if  (rtc.datetime.hours.op12_24) {  // 12 hour mode?
+				if (rtc.datetime.hours.tens >>1 ) { // PM
+					if ( hours !=12) hours = hours + 12;  // 1:00 PM to 11:59 PM ->  13:00 to 23:59
+				} else {
+					if ( hours ==12) hours = hours - 12;  // 12:00 AM to 12:59 AM ->  00:00 to 00:59
+				}
+			} else { // 24 hour mode
+				hours   = rtc.datetime.hours.tens   * 10 + rtc.datetime.hours.units;
+			}
+
+		} else { // make display error pattern
+			animateError();   
+		}
+
+	
 	} // end of main loop
 }
 //
-
 
 
 
@@ -403,12 +431,16 @@ void animateError(void) {  // called in main loop at every 4ms
 
 // advance current hour
 void advanceHours (void) {
+	
   uint8_t d = ((1
                 + 10 * (uint8_t)rtc.datetime.hours.tens
                 + (uint8_t)rtc.datetime.hours.units )   ) % 24;
 
   rtc.datetime.hours.tens = ( (uint8_t) d / 10 )  & 0b00000011;
   rtc.datetime.hours.units = ( (uint8_t) d % 10 ) & 0b00001111;
+  rtc.datetime.hours.op12_24 = 0; // force 24 hour mode
+
+  
   writeRtc();
 
 }
@@ -422,6 +454,7 @@ void advanceMinutes (void) {
 
   rtc.datetime.minutes.tens = ( (uint8_t) d / 10 )  & 0b00000111;
   rtc.datetime.minutes.units = ( (uint8_t) d % 10 ) & 0b00001111;
+  rtc.datetime.hours.op12_24 = 0; // force 24 hour mode
   writeRtc();
 }
 //
